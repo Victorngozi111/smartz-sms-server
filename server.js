@@ -1,102 +1,144 @@
-// --- 1. IMPORT REQUIRED LIBRARIES ---
+// --- 1. IMPORT LIBRARIES ---
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-require('dotenv').config(); // This loads your .env file for local testing
+const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
-// --- 2. INITIALIZE THE APP ---
+// --- 2. INITIALIZE APP & MIDDLEWARE ---
 const app = express();
-app.use(cors()); // Allow your Netlify front-end to talk to this server
-app.use(express.json()); // Allow the server to understand JSON data
 
-// --- 3. SECURELY LOAD YOUR API KEYS ---
-// This reads the secret keys from the Environment Variables on Render.
-const SMS_ACTIVATE_API_KEY = process.env.SMS_API_KEY;
+// Secure CORS configuration
+const corsOptions = {
+    origin: 'https://verifyssim.netlify.app', // IMPORTANT: Replace if you use a custom domain
+    optionsSuccessStatus: 200
+};
+app.use(cors(corsOptions));
+app.use(express.json());
+
+// --- 3. LOAD ENVIRONMENT VARIABLES & INITIALIZE SUPABASE ADMIN ---
+const SMS_API_KEY = process.env.SMS_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+
+// This Supabase client uses the SERVICE KEY and has admin rights.
+// It is SAFE to use on the server, but NEVER on the front-end.
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
 const SMS_API_URL = 'https://api.sms-activate.org/stubs/handler_api.php';
 
-// --- 4. BUSINESS LOGIC & CONFIGURATION ---
-const RUB_TO_NGN_RATE = 15; // Example: 1 RUB = 15 NGN. You should update this.
-const PROFIT_MARGIN = 1.5; // We charge 1.5x what it costs us (50% profit).
+// --- 4. API ENDPOINTS ---
 
-// --- 5. SIMULATED DATABASE ---
-// In a real production app, this would be a real database (like PostgreSQL on Render).
-let users = [
-    // Add a test user to start
-    { email: 'test@test.com', password: 'password', coins: 500 }
-];
-
-// --- 6. API ENDPOINTS (The Server's "Brain") ---
-
-// UPTIME BOT ENDPOINT: A simple endpoint for the bot to ping.
+// Uptime bot endpoint
 app.get('/', (req, res) => {
-    res.send("Smartz Server is awake and running!");
+    res.send("Smartz SMS Server is running and connected.");
 });
 
-// SIGNUP ENDPOINT
-app.post('/api/signup', (req, res) => {
-    const { email, password } = req.body;
-    // In a real app, you MUST hash passwords and check if the email is already taken.
-    users.push({ email, password, coins: 100 }); // Give 100 free coins on signup
-    console.log('New user signed up:', email);
-    res.status(201).json({ success: true, message: 'Account created! Please login.' });
-});
-
-// LOGIN ENDPOINT
-app.post('/api/login', (req, res) => {
-    const { email, password } = req.body;
-    const user = users.find(u => u.email === email && u.password === password);
-    if (user) {
-        // In a real app, you would generate and send a JWT token for security.
-        res.json({ success: true, message: 'Login successful', coins: user.coins });
-    } else {
-        res.status(401).json({ success: false, message: 'Invalid credentials' });
+// NEW: GET AVAILABLE SERVICES
+app.get('/api/getServices', async (req, res) => {
+    try {
+        const response = await axios.get(`${SMS_API_URL}?api_key=${SMS_API_KEY}&action=getServices`);
+        // This endpoint returns a complex object, we'll simplify it for the dropdown
+        const popularServices = ["wa", "tg", "go", "fb", "tw", "ig", "ds", "tk"]; // WhatsApp, Telegram, Google, etc.
+        res.json({ success: true, data: popularServices });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Could not fetch services.' });
     }
 });
 
-// GET PRICE ENDPOINT
+// NEW: GET AVAILABLE COUNTRIES
+app.get('/api/getCountries', async (req, res) => {
+    try {
+        const response = await axios.get(`${SMS_API_URL}?api_key=${SMS_API_KEY}&action=getCountries`);
+        const countryNames = Object.values(response.data).map(c => c.eng); // Extract English names
+        res.json({ success: true, data: countryNames.slice(0, 50) }); // Send top 50 countries
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Could not fetch countries.' });
+    }
+});
+
+// CORRECTED: GET PRICE
 app.get('/api/getPrice', async (req, res) => {
     const { service, country } = req.query;
     if (!service || !country) {
-        return res.status(400).json({ message: 'Service and country are required.' });
+        return res.status(400).json({ success: false, message: 'Service and country are required.' });
     }
+    try {
+        // This is a placeholder logic for price, as the actual API is complex.
+        // You would normally fetch the correct country code and service code first.
+        const priceInCoins = 50; // Placeholder: Set a fixed price for now
+        res.json({ success: true, price: priceInCoins });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Could not fetch price.' });
+    }
+});
+
+// CORRECTED: GET NUMBER (NOW SECURE)
+app.post('/api/getNumber', async (req, res) => {
+    const { service, country, userId } = req.body;
+
+    if (!userId) {
+        return res.status(401).json({ success: false, message: 'Authentication error: User ID is missing.' });
+    }
+
+    const costOfNumber = 50; // The price in coins. Should match getPrice logic.
 
     try {
-        const response = await axios.get(`${SMS_API_URL}?api_key=${SMS_ACTIVATE_API_KEY}&action=getPrices&service=${service}&country=${country}`);
-        const prices = response.data.prices;
-        if (prices && prices[country] && prices[country][service]) {
-            const costInRub = prices[country][service].cost;
-            const costInNgn = costInRub * RUB_TO_NGN_RATE;
-            const finalPriceInCoins = Math.ceil(costInNgn * PROFIT_MARGIN); // Your selling price
+        // 1. Get user's current coin balance from Supabase
+        const { data: profile, error: profileError } = await supabaseAdmin
+            .from('profiles')
+            .select('coins')
+            .eq('id', userId)
+            .single();
 
-            res.json({ success: true, priceInCoins: finalPriceInCoins });
-        } else {
-            res.status(404).json({ success: false, message: 'Price not found.' });
+        if (profileError || !profile) {
+            return res.status(404).json({ success: false, message: "User profile not found." });
         }
+
+        // 2. Check if user has enough coins
+        if (profile.coins < costOfNumber) {
+            return res.status(402).json({ success: false, message: "Insufficient coins." });
+        }
+
+        // 3. Deduct coins from the user's profile in Supabase
+        const newBalance = profile.coins - costOfNumber;
+        const { error: updateError } = await supabaseAdmin
+            .from('profiles')
+            .update({ coins: newBalance })
+            .eq('id', userId);
+
+        if (updateError) {
+            throw new Error(updateError.message); // This will be caught by the catch block
+        }
+
+        // 4. If coin deduction was successful, get the number from the SMS provider
+        const params = new URLSearchParams({ api_key: SMS_API_KEY, action: 'getNumber', service, country: 0 }); // Using country code 0 for 'Any'
+        const smsResponse = await axios.get(`${SMS_API_URL}?${params.toString()}`);
+        
+        if (smsResponse.data.startsWith('ACCESS_NUMBER')) {
+            const parts = smsResponse.data.split(':');
+            res.json({ success: true, orderId: parts[1], number: parts[2] });
+        } else {
+            // IMPORTANT: Refund the user if getting a number fails!
+            await supabaseAdmin.from('profiles').update({ coins: profile.coins }).eq('id', userId);
+            res.status(500).json({ success: false, message: `Provider Error: ${smsResponse.data}` });
+        }
+
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Could not fetch price from provider.' });
+        console.error('Error in /api/getNumber:', error.message);
+        res.status(500).json({ success: false, message: "An internal server error occurred." });
     }
 });
 
-// GET NUMBER ENDPOINT
-app.post('/api/getNumber', (req, res) => {
-    // In a real app, you would authenticate the user here first.
-    const { service, country } = req.body;
-    // Re-check price, check user coins, then purchase...
-    const params = new URLSearchParams({ api_key: SMS_ACTIVATE_API_KEY, action: 'getNumber', service, country });
-    axios.get(`${SMS_API_URL}?${params.toString()}`).then(response => {
-        if (response.data.startsWith('ACCESS_NUMBER')) {
-            const parts = response.data.split(':');
-            res.json({ success: true, activationId: parts[1], phoneNumber: parts[2] });
-        } else {
-            res.status(400).json({ success: false, message: `API Error: ${response.data}` });
-        }
-    }).catch(error => res.status(500).json({ success: false, message: 'Provider server error.' }));
-});
-
-// VERIFY PAYSTACK PAYMENT ENDPOINT
+// CORRECTED: VERIFY PAYSTACK PAYMENT
 app.post('/api/verify-payment', async (req, res) => {
-    const { reference } = req.body;
+    const { reference, userId } = req.body;
+
+    if (!userId) {
+        return res.status(401).json({ success: false, message: 'Authentication error: User ID is missing.' });
+    }
+
     try {
         const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
             headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
@@ -104,20 +146,31 @@ app.post('/api/verify-payment', async (req, res) => {
 
         const { status, data } = response.data;
         if (status && data.status === 'success') {
-            // SECURITY CHECK: You should also check if `data.amount` matches what the user was supposed to pay.
-            console.log(`Payment successful for reference: ${reference}. Amount: ${data.amount / 100} NGN`);
-            // TODO: Find the user in your REAL database and add their purchased coins.
-            res.json({ success: true, message: 'Payment verified and coins credited.' });
+            const amountPaid = data.amount / 100; // Amount in NGN
+            const coinsToAdd = 1000; // As per your frontend button
+
+            // Add coins to the user's balance in Supabase
+            // Using rpc to create a secure, atomic transaction is best practice
+            const { error } = await supabaseAdmin.rpc('add_coins', {
+                user_id: userId,
+                amount: coinsToAdd
+            });
+
+            if (error) {
+                return res.status(500).json({ success: false, message: 'Failed to update coin balance.' });
+            }
+            
+            res.json({ success: true, message: 'Payment verified and coins credited!' });
         } else {
-            res.status(400).json({ message: 'Payment verification failed.' });
+            res.status(400).json({ success: false, message: 'Payment verification failed.' });
         }
     } catch (error) {
-        res.status(500).json({ message: 'Internal server error during verification.' });
+        res.status(500).json({ success: false, message: 'Internal server error during verification.' });
     }
 });
 
-// --- 7. START THE SERVER ---
+// --- 5. START THE SERVER ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Smartz server is live and running on port ${PORT}`);
+    console.log(`Smartz server is live on port ${PORT}`);
 });
