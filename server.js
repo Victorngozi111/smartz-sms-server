@@ -13,9 +13,7 @@ const app = express();
 const allowedOrigins = ['https://verifyssim.netlify.app', 'http://127.0.0.1:5500']; // Add your frontend URLs
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.endsWith('--verifyssim.netlify.app')) {
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('--verifyssim.netlify.app')) {
       return callback(null, true);
     }
     return callback(new Error('Request blocked by CORS'));
@@ -38,7 +36,7 @@ if (!SMS_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_KEY || !PAYSTACK_SECRET_K
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const SMS_API_URL = 'https://api.sms-activate.org/stubs/handler_api.php';
 const PROFIT_MARGIN = 1.4; // 40% profit
-const NGN_PER_COIN = 15; // Base price in NGN for one coin (the price you show the user)
+const NGN_PER_COIN = 15;
 
 // --- API ENDPOINTS ---
 app.get('/', (req, res) => res.send("Verify SMS Server is running."));
@@ -49,11 +47,10 @@ app.get('/api/getCountries', async (req, res) => {
         if (typeof response.data !== 'object' || response.data === null) {
             throw new Error("Invalid data from SMS provider");
         }
-        // The API returns an object where keys are country IDs and values are country data
         const countries = Object.entries(response.data).map(([id, countryData]) => ({
             id: id,
             name: countryData.eng
-        })).filter(c => c.name); // Filter out any entries without an English name
+        })).filter(c => c.name).sort((a, b) => a.name.localeCompare(b.name)); // Sort countries alphabetically
         
         res.json({ success: true, data: countries });
     } catch (error) {
@@ -75,14 +72,13 @@ app.get('/api/getPrice', async (req, res) => {
             throw new Error("Invalid price data from SMS provider");
         }
 
-        // The response structure is { "country": { "service": { "cost": X, "count": Y } } }
         const priceData = response.data[country]?.[service];
         if (!priceData || !priceData.cost) {
             return res.status(404).json({ success: false, message: 'This service is not available in the selected country.' });
         }
 
         const basePriceInCoins = parseFloat(priceData.cost);
-        const finalPrice = Math.ceil(basePriceInCoins * PROFIT_MARGIN); // Apply 40% profit and round up
+        const finalPrice = Math.ceil(basePriceInCoins * PROFIT_MARGIN);
 
         res.json({ success: true, price: finalPrice });
 
@@ -93,7 +89,7 @@ app.get('/api/getPrice', async (req, res) => {
 });
 
 app.post('/api/getNumber', async (req, res) => {
-    const { service, country, userId } = req.body;
+    const { service, country, userId, serviceName } = req.body; // Added serviceName
     if (!service || !country || !userId) {
         return res.status(400).json({ success: false, message: 'Service, country, and user ID are required.' });
     }
@@ -108,30 +104,16 @@ app.post('/api/getNumber', async (req, res) => {
         const finalPrice = Math.ceil(parseFloat(priceData.cost) * PROFIT_MARGIN);
 
         // 2. Check user's balance
-        const { data: profile, error: profileError } = await supabaseAdmin
-            .from('profiles')
-            .select('coins')
-            .eq('id', userId)
-            .single();
-
-        if (profileError || !profile) {
-            return res.status(404).json({ success: false, message: 'User profile not found.' });
-        }
-
+        const { data: profile, error: profileError } = await supabaseAdmin.from('profiles').select('coins').eq('id', userId).single();
+        if (profileError) throw new Error('Could not retrieve user profile.');
         if (profile.coins < finalPrice) {
             return res.status(402).json({ success: false, message: 'Insufficient coins. Please add more to your balance.' });
         }
 
         // 3. Deduct coins from user's balance
         const newBalance = profile.coins - finalPrice;
-        const { error: updateError } = await supabaseAdmin
-            .from('profiles')
-            .update({ coins: newBalance })
-            .eq('id', userId);
-
-        if (updateError) {
-            throw new Error('Failed to update user balance.');
-        }
+        const { error: updateError } = await supabaseAdmin.from('profiles').update({ coins: newBalance }).eq('id', userId);
+        if (updateError) throw new Error('Failed to update user balance.');
 
         // 4. Request the number from the SMS provider
         const numberResponse = await axios.get(`${SMS_API_URL}?api_key=${SMS_API_KEY}&action=getNumber&service=${service}&country=${country}`);
@@ -139,10 +121,9 @@ app.post('/api/getNumber', async (req, res) => {
         
         if (responseText.startsWith('ACCESS_NUMBER')) {
             const [, orderId, number] = responseText.split(':');
-            res.json({ success: true, number, orderId });
+            res.json({ success: true, number, orderId, serviceName });
         } else {
-            // If getting number failed, refund the user
-            await supabaseAdmin.from('profiles').update({ coins: profile.coins }).eq('id', userId);
+            await supabaseAdmin.from('profiles').update({ coins: profile.coins }).eq('id', userId); // Refund on failure
             throw new Error(`Failed to get number: ${responseText}`);
         }
 
@@ -161,9 +142,7 @@ app.post('/api/verify-payment', async (req, res) => {
     try {
         // 1. Verify transaction with Paystack
         const response = await axios.get(`https://api.paystack.co/transaction/verify/${reference}`, {
-            headers: {
-                Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`
-            }
+            headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
         });
 
         const { status, data } = response.data;
@@ -172,35 +151,19 @@ app.post('/api/verify-payment', async (req, res) => {
         }
 
         // 2. Calculate coins to add
-        const amountPaidNGN = data.amount / 100; // Paystack amount is in kobo
+        const amountPaidNGN = data.amount / 100;
         const coinsToAdd = Math.floor(amountPaidNGN / NGN_PER_COIN);
-
         if (coinsToAdd < 1) {
             return res.status(400).json({ success: false, message: 'Amount is too small to purchase any coins.' });
         }
 
-        // 3. Add coins to user's profile
-        const { data: profile, error: profileError } = await supabaseAdmin
-            .from('profiles')
-            .select('coins')
-            .eq('id', userId)
-            .single();
-
-        if (profileError || !profile) {
-            return res.status(404).json({ success: false, message: 'User not found.' });
-        }
-
-        const newTotalCoins = profile.coins + coinsToAdd;
-
-        const { error: updateError } = await supabaseAdmin
-            .from('profiles')
-            .update({ coins: newTotalCoins })
-            .eq('id', userId);
-
-        if (updateError) {
-            throw new Error("Failed to update user's coin balance.");
-        }
-
+        // 3. Add coins to user's profile using an RPC function for safety
+        const { error } = await supabaseAdmin.rpc('add_coins', {
+            user_id: userId,
+            amount: coinsToAdd
+        });
+        if (error) throw new Error("Database error: Could not add coins.");
+        
         res.json({ success: true, message: `${coinsToAdd} coins added successfully.` });
 
     } catch (error) {
@@ -208,7 +171,6 @@ app.post('/api/verify-payment', async (req, res) => {
         res.status(500).json({ success: false, message: 'An error occurred during payment verification.' });
     }
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Verify SMS server live on port ${PORT}`));
