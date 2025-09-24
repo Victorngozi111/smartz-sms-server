@@ -1,5 +1,5 @@
 // --- server.js ---
-// FINAL VERSION: Implements the fixed-profit business model (e.g., add 1500/2000 NGN).
+// FINAL VERSION: Implements your new business rule: (API Price in NGN) + 1500 NGN Profit.
 
 const express = require('express');
 const cors = require('cors');
@@ -35,20 +35,24 @@ if (!SMSPVA_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_KEY || !PAYSTACK_SECRE
 
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const SMS_API_URL = 'http://api.smspva.com/server.php';
+
+// --- YOUR NEW BUSINESS RULES (ALL IN ONE PLACE) ---
 const NGN_PER_COIN = 15;
-
-// --- YOUR NEW BUSINESS RULES ---
-const STANDARD_PROFIT_NGN = 1500;
-const PREMIUM_PROFIT_NGN = 2000;
-const PREMIUM_PRICE_THRESHOLD_COINS = 50; // If base cost is over this, use premium profit.
-
-// Convert your Naira profit into Coins
-const STANDARD_PROFIT_COINS = Math.ceil(STANDARD_PROFIT_NGN / NGN_PER_COIN); // = 100 Coins
-const PREMIUM_PROFIT_COINS = Math.ceil(PREMIUM_PROFIT_NGN / NGN_PER_COIN);   // = 134 Coins
-
+const USD_TO_NGN_CONVERSION_RATE = 1500; // Your rule: $1 = 1500 NGN
+const FIXED_PROFIT_NGN = 1500;           // Your rule: Add 1500 NGN profit
+const RUB_TO_USD_RATE = 0.011;           // Real-time conversion for API price
 
 // --- API ENDPOINTS ---
 app.get('/', (req, res) => res.send("Verify SMS Server is running with smspva.com API."));
+
+// Helper function for the new pricing model
+const calculateFinalPriceInCoins = (basePriceInRub) => {
+    const basePriceInUsd = basePriceInRub * RUB_TO_USD_RATE;
+    const basePriceInNgn = basePriceInUsd * USD_TO_NGN_CONVERSION_RATE;
+    const finalPriceInNgn = basePriceInNgn + FIXED_PROFIT_NGN;
+    const finalPriceInCoins = Math.ceil(finalPriceInNgn / NGN_PER_COIN);
+    return finalPriceInCoins;
+};
 
 app.get('/api/getServices', async (req, res) => {
     try {
@@ -70,7 +74,6 @@ app.get('/api/getCountries', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
 
-// --- UPDATED PRICING LOGIC HERE ---
 app.get('/api/getPrice', async (req, res) => {
     const { service, country } = req.query;
     if (!service || !country) return res.status(400).json({ success: false, message: 'Service and country are required.' });
@@ -78,43 +81,29 @@ app.get('/api/getPrice', async (req, res) => {
         const response = await axios.get(`${SMS_API_URL}?metod=get_service_price&country=${country}&service=${service}&api_key=${SMSPVA_API_KEY}`);
         if (response.data.response !== 1 || !response.data.price) return res.status(404).json({ success: false, message: 'Service not available in this country.' });
         
-        const basePrice = parseFloat(response.data.price);
-        let finalPrice;
+        const basePriceInRub = parseFloat(response.data.price);
+        const finalPriceInCoins = calculateFinalPriceInCoins(basePriceInRub);
 
-        if (basePrice > PREMIUM_PRICE_THRESHOLD_COINS) {
-            finalPrice = Math.ceil(basePrice + PREMIUM_PROFIT_COINS);
-        } else {
-            finalPrice = Math.ceil(basePrice + STANDARD_PROFIT_COINS);
-        }
-
-        res.json({ success: true, price: finalPrice });
+        res.json({ success: true, price: finalPriceInCoins });
     } catch (error) { res.status(500).json({ success: false, message: 'Could not fetch price.' }); }
 });
 
-// --- UPDATED PRICING LOGIC HERE TOO (FOR SECURITY) ---
 app.post('/api/getNumber', async (req, res) => {
     const { service, country, userId, serviceName } = req.body;
     if (!service || !country || !userId) return res.status(400).json({ success: false, message: 'Missing required fields.' });
-
     try {
         const priceResponse = await axios.get(`${SMS_API_URL}?metod=get_service_price&country=${country}&service=${service}&api_key=${SMSPVA_API_KEY}`);
         if (priceResponse.data.response !== 1) throw new Error('Could not get price for this service.');
 
-        const basePrice = parseFloat(priceResponse.data.price);
-        let finalPrice;
-
-        if (basePrice > PREMIUM_PRICE_THRESHOLD_COINS) {
-            finalPrice = Math.ceil(basePrice + PREMIUM_PROFIT_COINS);
-        } else {
-            finalPrice = Math.ceil(basePrice + STANDARD_PROFIT_COINS);
-        }
+        const basePriceInRub = parseFloat(priceResponse.data.price);
+        const finalPriceInCoins = calculateFinalPriceInCoins(basePriceInRub);
 
         const { data: profile } = await supabaseAdmin.from('profiles').select('coins').eq('id', userId).single();
-        if (!profile || profile.coins < finalPrice) return res.status(402).json({ success: false, message: 'Insufficient coins.' });
+        if (!profile || profile.coins < finalPriceInCoins) return res.status(402).json({ success: false, message: 'Insufficient coins.' });
 
         const numberResponse = await axios.get(`${SMS_API_URL}?metod=get_number&country=${country}&service=${service}&api_key=${SMSPVA_API_KEY}`);
         if (numberResponse.data.response === 1) {
-            const newBalance = profile.coins - finalPrice;
+            const newBalance = profile.coins - finalPriceInCoins;
             await supabaseAdmin.from('profiles').update({ coins: newBalance }).eq('id', userId);
             res.json({ success: true, number: numberResponse.data.number, orderId: numberResponse.data.id, serviceName: serviceName });
         } else {
