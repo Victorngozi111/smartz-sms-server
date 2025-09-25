@@ -10,12 +10,19 @@ require('dotenv').config();
 const app = express();
 
 // --- CORS CONFIGURATION ---
+// This is updated to correctly allow your Netlify site to connect.
 const allowedOrigins = ['https://verifyssim.netlify.app', 'http://127.0.0.1:5500'];
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('--verifyssim.netlify.app')) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
+    // Handle Netlify's preview deploy URLs
+    if (origin.endsWith('--verifyssim.netlify.app')) {
+      return callback(null, true);
+    }
+    console.log(`CORS blocked request from origin: ${origin}`);
     return callback(new Error('Request blocked by CORS'));
   }
 };
@@ -48,8 +55,20 @@ app.get('/', (req, res) => res.send("Verify SMS Server is running with smspva.co
 // Helper function for the new pricing model
 const calculateFinalPriceInCoins = (basePriceInRub) => {
     const basePriceInUsd = basePriceInRub * RUB_TO_USD_RATE;
+
+    // Special rule: $5 = 10,000 NGN
+    if (basePriceInUsd >= 4.95 && basePriceInUsd <= 5.05) { // Check if price is around $5
+        const finalPriceInNgn = 10000;
+        return Math.ceil(finalPriceInNgn / NGN_PER_COIN);
+    }
+    
+    // Convert base price to NGN
     const basePriceInNgn = basePriceInUsd * USD_TO_NGN_CONVERSION_RATE;
+    
+    // Add your profit
     const finalPriceInNgn = basePriceInNgn + FIXED_PROFIT_NGN;
+    
+    // Convert final NGN price to coins
     const finalPriceInCoins = Math.ceil(finalPriceInNgn / NGN_PER_COIN);
     return finalPriceInCoins;
 };
@@ -58,7 +77,8 @@ app.get('/api/getServices', async (req, res) => {
     try {
         const response = await axios.get(`${SMS_API_URL}?metod=get_services_list&api_key=${SMSPVA_API_KEY}`);
         if (!response.data || response.data.response === "0") throw new Error("Could not fetch services.");
-        const services = response.data.map(s => ({ code: s.id, name: s.name }));
+        // We add the quantity property here, which you wanted to display
+        const services = response.data.map(s => ({ code: s.id, name: s.name, quantity: s.quantity }));
         res.json({ success: true, data: services });
     } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
@@ -84,7 +104,7 @@ app.get('/api/getPrice', async (req, res) => {
         const basePriceInRub = parseFloat(response.data.price);
         const finalPriceInCoins = calculateFinalPriceInCoins(basePriceInRub);
 
-        res.json({ success: true, price: finalPriceInCoins });
+        res.json({ success: true, data: { price: finalPriceInCoins } }); // Send price inside a 'data' object
     } catch (error) { res.status(500).json({ success: false, message: 'Could not fetch price.' }); }
 });
 
@@ -105,7 +125,7 @@ app.post('/api/getNumber', async (req, res) => {
         if (numberResponse.data.response === 1) {
             const newBalance = profile.coins - finalPriceInCoins;
             await supabaseAdmin.from('profiles').update({ coins: newBalance }).eq('id', userId);
-            res.json({ success: true, number: numberResponse.data.number, orderId: numberResponse.data.id, serviceName: serviceName });
+            res.json({ success: true, data: { number: numberResponse.data.number, orderId: numberResponse.data.id, serviceName: serviceName } });
         } else {
             throw new Error(numberResponse.data.error_msg || 'Provider error getting number.');
         }
@@ -118,8 +138,8 @@ app.get('/api/getStatus', async (req, res) => {
     try {
         const response = await axios.get(`${SMS_API_URL}?metod=get_sms&id=${orderId}&api_key=${SMSPVA_API_KEY}`);
         const data = response.data;
-        if (data.response === "1") res.json({ success: true, status: 'SUCCESS', code: data.sms });
-        else if (data.response === "2") res.json({ success: true, status: 'WAITING', message: 'Waiting for SMS...' });
+        if (data.response === "1") res.json({ success: true, data: { status: 'SUCCESS', code: data.sms } });
+        else if (data.response === "2") res.json({ success: true, data: { status: 'WAITING', message: 'Waiting for SMS...' } });
         else throw new Error(data.error_msg || 'Could not get status.');
     } catch (error) { res.status(500).json({ success: false, message: error.message }); }
 });
